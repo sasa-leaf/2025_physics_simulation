@@ -1,0 +1,17 @@
+[tool.poetry]
+name = "2025-physics-simulation"
+version = "0.1.0"
+description = ""
+authors = ["sasa-leaf <shunsan3suke@gmail.com>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.11"
+numpy = "^2.3.5"
+matplotlib = "^3.10.7"
+taichi = "^1.7.4"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
