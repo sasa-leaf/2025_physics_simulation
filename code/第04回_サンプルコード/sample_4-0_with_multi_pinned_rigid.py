@@ -15,7 +15,7 @@ gravity = ti.Vector([0.0,-9.8]) # 重力加速度[m/s^2]
 
 # 流体の物性値
 fluid_density = 1000.0 # 密度[kg/m^3]
-fluid_viscosity = 0.001 # 粘性係数[Pa*s]
+fluid_viscosity = 100 # 粘性係数[Pa*s]
 fluid_sound = 10.0 # （仮想的な）音速[m/s]
 
 # 定数
