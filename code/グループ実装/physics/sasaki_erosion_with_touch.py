@@ -29,6 +29,10 @@ pnd0_gradP = ti.field(ti.f32,shape=())
 collision_dist = psize*0.9 # 衝突判定距離
 collision_coef = 0.5 # 反発係数
 
+# 侵食モデル
+erosion_prob = 0.02
+erosion_dist = psize * 1.1
+
 # 粒子タイプ識別用定数
 type_fluid = 0
 type_wall = 1
@@ -50,6 +54,7 @@ type_strong_wall = 3
 
 # くねった管（上部だけろうと型）の壁を作成する関数
 # 川以外の部分をすべて埋める壁作成関数
+# くねった管（上部だけろうと型）の壁を作成する関数
 def create_sine_pipe_wall(y_min, y_max, width_top, width_bottom, amplitude, frequency):
     array_pos = []
     array_type_local = [] 
@@ -307,7 +312,7 @@ def update():
     # 力の計算（1回目）
     for i in range(N_particles):
         particles_force[i].fill(0.0)
-        if particles_type[i] == type_wall or particles_type[i] == type_ghost:
+        if particles_type[i] == type_wall or particles_type[i] == type_ghost or particles_type[i] == type_strong_wall:
             continue
         # 重力
         if particles_type[i] == type_fluid:
@@ -329,6 +334,15 @@ def update():
                 if particles_type[i] == type_fluid or particles_type[j] == type_fluid:
                     if dist_ij < re:
                         particles_force[i] += fluid_viscosity*4.0/(pnd0[None]*lambda0[None])*(particles_vel[j]-particles_vel[i])*weight(dist_ij)
+
+                # 壁の侵食
+                if particles_type[j] == type_wall:
+                    if dist_ij < erosion_dist:
+                        # 確率で壁を流体に変化させる
+                        if ti.random() < erosion_prob:
+                            particles_type[j] = type_fluid
+                            # 速度を少し与える
+                            particles_vel[j] = particles_vel[i] * 0.5
 
     # 粒子の仮速度と仮位置
     for i in range(N_particles):
@@ -438,7 +452,7 @@ def update():
                             elif (particles_type[i],particles_type[j]) == (type_fluid,type_wall):
                                 m_ij = fluid_density
                                 particles_force[i] += normal_ij*(1.0+collision_coef)*m_ij*tmp/dt_max
-    
+
     # 粒子の速度と位置の修正
     for i in range(N_particles):
         if particles_type[i] == type_fluid:
