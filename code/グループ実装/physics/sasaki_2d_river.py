@@ -11,7 +11,7 @@ domain[0] = (-1.0,-1.0) # (x_min,y_min)
 domain[1] = (1.0,1.0) # (x_max,y_max)
 
 # 重力
-gravity = ti.Vector([0.0,-0.1]) # 重力加速度[m/s^2]
+gravity = ti.Vector([0.0,-3.0]) # 重力加速度[m/s^2]
 
 # 流体の物性値
 fluid_density = 1000.0 # 密度[kg/m^3]
@@ -19,7 +19,7 @@ fluid_viscosity = 0.001 # 粘性係数[Pa*s]
 fluid_sound = 10.0 # （仮想的な）音速[m/s]
 
 # 定数
-psize = 0.025 # 初期粒子間距離[m]
+psize = 0.0125 # 初期粒子間距離[m]
 re = psize*2.5 # 影響半径
 pnd0 = ti.field(ti.f32,shape=())
 lambda0 = ti.field(ti.f32,shape=())
@@ -33,6 +33,7 @@ collision_coef = 0.5 # 反発係数
 type_fluid = 0
 type_wall = 1
 type_ghost = 2
+type_strong_wall = 3
 
 # # 矩形形状の粒子配置を返す関数
 # def create_rectangle(center_x,center_y,width,height):
@@ -51,60 +52,63 @@ type_ghost = 2
 # 川以外の部分をすべて埋める壁作成関数
 def create_sine_pipe_wall(y_min, y_max, width_top, width_bottom, amplitude, frequency):
     array_pos = []
+    array_type_local = [] 
     
-    # 領域のX範囲（グローバル変数のdomainに合わせるのが一般的ですが、ここでは直接指定または引数化）
     x_min_domain = -1.0
     x_max_domain = 1.0
 
-    # 0除算防止
     height = y_max - y_min
     if height <= 0: height = 1.0
 
-    # ▼ 設定：上部何割を「ろうと」にするか
+    # 設定：上部何割を「ろうと」にするか
     funnel_ratio = 0.2 
     funnel_start_ratio = 1.0 - funnel_ratio
 
-    # y座標ループ
     num_y = int(height / (psize * 0.8))
     
     for i in range(num_y):
         y = y_max - i * (psize * 0.8) # 上から下へ
         
-        # 高さ割合と川幅の計算
         ratio = (y - y_min) / height
         
-        if ratio < funnel_start_ratio:
-            # 【下部】一定幅
+        is_funnel_part = (ratio >= funnel_start_ratio)
+        current_type = type_strong_wall if is_funnel_part else type_wall
+        
+        if not is_funnel_part:
             current_width = width_bottom
         else:
-            # 【上部】ろうと状に広がる
             funnel_progress = (ratio - funnel_start_ratio) / funnel_ratio
             current_width = width_bottom + (width_top - width_bottom) * funnel_progress
 
-        # 川の中心X座標
         center_x = amplitude * math.sin(frequency * y * math.pi)
         
-        # 川の左端と右端のX座標
         river_left_edge = center_x - current_width / 2.0
         river_right_edge = center_x + current_width / 2.0
 
         # --- 左側の埋め尽くし ---
-        # 領域左端(x_min_domain) から 川の左端(river_left_edge) まで粒子を配置
-        # numpy.arangeを使うと綺麗に等間隔で生成できます
+        # こちらは x_min_domain (-1.0) から開始しているのでグリッドはずれない
         x_cursor = x_min_domain
         while x_cursor < river_left_edge:
             array_pos.append([x_cursor, y])
+            array_type_local.append(current_type)
             x_cursor += psize
 
         # --- 右側の埋め尽くし ---
-        # 川の右端(river_right_edge) から 領域右端(x_max_domain) まで粒子を配置
-        x_cursor = river_right_edge
-        while x_cursor <= x_max_domain: # 右端も含むように <=
+        # 【修正箇所】
+        # 以前: x_cursor = river_right_edge (これがねじれの原因)
+        # 修正: グリッド(-1.0基準)に乗るような位置を計算してスタートする
+        
+        # 「-1.0 から psize 刻みで進んで、river_right_edge を超えた最初の地点」を計算
+        # x = -1.0 + k * psize >= river_right_edge
+        k = math.ceil((river_right_edge - x_min_domain) / psize)
+        x_cursor = x_min_domain + k * psize
+
+        while x_cursor <= x_max_domain:
             array_pos.append([x_cursor, y])
+            array_type_local.append(current_type)
             x_cursor += psize
 
-    array_pos = numpy.array(array_pos, dtype=numpy.float32)
-    return array_pos
+    return numpy.array(array_pos, dtype=numpy.float32), numpy.array(array_type_local, dtype=numpy.int32)
 
 # # 矩形タンク壁面の粒子配置を返す関数
 # def create_rectangle_wall(center_x,center_y,width,height,layer=3):
@@ -122,22 +126,23 @@ def create_sine_pipe_wall(y_min, y_max, width_top, width_bottom, amplitude, freq
 #     return array_pos
 
 # 初期粒子データ用の配列を作成する
-array_type = [] # 粒子タイプを格納する一時変数
-array_pos = [] # 粒子位置を格納する一時変数
+array_type = [] 
+array_pos = []
 
-# pipe_width: 管の太さ, amplitude: くねりの大きさ, frequency: くねりの頻度
-# パイプ作成の呼び出し部分
-wall_pset = create_sine_pipe_wall(
+# パイプ作成の呼び出し部分（★修正）
+wall_positions, wall_types = create_sine_pipe_wall(
     domain[0].y, 
     domain[1].y, 
-    width_top=0.5,    # ろうとの一番上の広さ
-    width_bottom=0.2, # 通常の川幅（一定）
-    amplitude=0.2,    # くねりの大きさ
+    width_top=0.5,    
+    width_bottom=0.2, 
+    amplitude=0.2,    
     frequency=1.0,
 )
-for i in range(len(wall_pset)):
-    array_type.append(type_wall)
-    array_pos.append(wall_pset[i])
+
+# 生成された壁とろうと粒子を追加
+for i in range(len(wall_positions)):
+    array_pos.append(wall_positions[i])
+    array_type.append(wall_types[i])
 
 N_space = 10000 # 流入粒子用の空きスロット数
 for i in range(N_space):
@@ -185,7 +190,7 @@ for ix,iy in ti.ndrange((-10,11),(-10,11)):
     y_i = iy*psize
     if x_i**2+y_i**2 < (psize*7)**2:
         array_pos.append([x_i,y_i])
-        array_vel.append([0.0,-0.5])
+        array_vel.append([0.0,-2.0])
 array_pos = numpy.array(array_pos,dtype=numpy.float32)
 array_vel = numpy.array(array_vel,dtype=numpy.float32)
 N_injectors = len(array_pos)
@@ -195,7 +200,7 @@ injectors_pos.from_numpy(array_pos)
 injectors_vel.from_numpy(array_vel)
 
 # 安定条件
-dt_max = 0.0025 # dtの上限値
+dt_max = 0.00125 # dtの上限値
 courant_max = 0.1 # 最大クーラン数
 diffusion_max = 0.1 # 最大拡散数
 
