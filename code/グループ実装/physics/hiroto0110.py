@@ -1,6 +1,5 @@
-import shutil
 import taichi as ti
-import numpy
+import numpy as np
 import math
 import os
 ti.init(arch=ti.cpu) # CPUを使う場合
@@ -18,7 +17,6 @@ gravity = ti.Vector([0.0,-4.0]) # 重力加速度[m/s^2]
 fluid_density = 1000.0 # 密度[kg/m^3]
 fluid_viscosity = 0.001 # 粘性係数[Pa*s]
 fluid_sound = 10.0 # （仮想的な）音速[m/s]
-initial_fluid_velocity = ti.Vector([0.0, -1.0])
 
 # 定数
 psize = 0.0125 # 初期粒子間距離[m]
@@ -42,6 +40,14 @@ solidification_time_threshold = 0.4 # 停滞がこの秒数続いたら壁化す
 # 空間成長（空隙埋め）モデル
 growth_prob = 0.005           # 1ステップあたりに成長する確率
 growth_suppress_dist = psize * 2.0 # この距離内に流体がいると成長しない
+
+# 2.5D効果のパラメータ
+vorticity_scale = 5.0          # 渦度の色マッピングスケール
+depth_pressure_weight = 0.3    # 擬似深度計算での圧力の重み
+depth_velocity_weight = 0.5    # 擬似深度計算での速度の重み
+depth_noise_weight = 0.2       # 擬似深度計算でのノイズの重み
+fog_distance = 2.0             # フォグ効果の距離パラメータ
+depth_scale_factor = 0.3       # 深度によるスケーリング係数
 
 # 粒子タイプ識別用定数
 type_fluid = 0
@@ -123,50 +129,7 @@ def create_sine_pipe_wall(y_min, y_max, width_top, width_bottom, amplitude, freq
             array_type_local.append(current_type)
             x_cursor += psize
 
-    return numpy.array(array_pos, dtype=numpy.float32), numpy.array(array_type_local, dtype=numpy.int32)
-
-# パイプ内部（流体部分）の初期配置を作成する関数
-def create_fluid_inside_pipe(y_min, y_max, width_top, width_bottom, amplitude, frequency):
-    array_pos = []
-    
-    # 上端ギリギリまで埋めると流入と干渉するため、少し下げて終わる
-    fill_y_max = y_max - psize * 4.0 
-    
-    height = y_max - y_min
-    if height <= 0: height = 1.0
-    
-    funnel_ratio = 0.2
-    funnel_start_ratio = 1.0 - funnel_ratio
-
-    # psize間隔で配置
-    num_y = int((fill_y_max - y_min) / psize)
-    
-    for i in range(num_y):
-        y = y_min + i * psize
-        
-        ratio = (y - y_min) / height
-        
-        # 壁生成と同じロジックで幅と中心を計算
-        is_funnel_part = (ratio >= funnel_start_ratio)
-        
-        if not is_funnel_part:
-            current_width = width_bottom
-        else:
-            funnel_progress = (ratio - funnel_start_ratio) / funnel_ratio
-            current_width = width_bottom + (width_top - width_bottom) * funnel_progress
-
-        center_x = amplitude * math.sin(frequency * y * math.pi)
-        
-        # 壁と重ならないように少しマージン(psize)をとって内側を埋める
-        inner_left = center_x - current_width / 2.0 + psize
-        inner_right = center_x + current_width / 2.0 - psize
-        
-        x_cursor = inner_left
-        while x_cursor <= inner_right:
-            array_pos.append([x_cursor, y])
-            x_cursor += psize
-
-    return numpy.array(array_pos, dtype=numpy.float32)
+    return np.array(array_pos, dtype=np.float32), np.array(array_type_local, dtype=np.int32)
 
 # # 矩形タンク壁面の粒子配置を返す関数
 # def create_rectangle_wall(center_x,center_y,width,height,layer=3):
@@ -187,81 +150,28 @@ def create_fluid_inside_pipe(y_min, y_max, width_top, width_bottom, amplitude, f
 array_type = [] 
 array_pos = []
 
-# --- パラメータ設定（壁と共通にするため変数化） ---
-p_y_min = domain[0].y
-p_y_max = domain[1].y
-p_width_top = 0.4
-p_width_bottom = 0.3
-p_amp = 0.4
-p_freq = 2.0
-
-# 1. 壁の生成
+# パイプ作成の呼び出し部分（★修正）
 wall_positions, wall_types = create_sine_pipe_wall(
-    p_y_min, p_y_max, p_width_top, p_width_bottom, p_amp, p_freq
+    domain[0].y, 
+    domain[1].y, 
+    width_top=0.4,    
+    width_bottom=0.3, 
+    amplitude=0.4,    
+    frequency=2.0,
 )
+
+# 生成された壁とろうと粒子を追加
 for i in range(len(wall_positions)):
     array_pos.append(wall_positions[i])
     array_type.append(wall_types[i])
 
-# 2. 初期流体の生成
-fluid_positions = create_fluid_inside_pipe(
-    p_y_min, p_y_max, p_width_top, p_width_bottom, p_amp, p_freq
-)
-# 流体粒子を配列に追加（1つ跳びで追加して密度を下げる）
-for i in range(0, len(fluid_positions), 2):
-    array_pos.append(fluid_positions[i])
-    array_type.append(type_fluid)
-
-# 3. ゴースト粒子の確保（多めに確保推奨）
-N_space = 20000 
+N_space = 10000 # 流入粒子用の空きスロット数
 for i in range(N_space):
     array_type.append(type_ghost)
     array_pos.append([0.0,0.0])
 
-array_type = numpy.array(array_type,dtype=numpy.int32)
-array_pos = numpy.array(array_pos,dtype=numpy.float32)
-N_particles = len(array_pos) 
-
-# --- 自動流入用（Top Inflow）の設定 ---
-# パイプ上端の開口部にエミッターを配置
-top_emitters_list = []
-# 上端の形状計算
-top_center_x = p_amp * math.sin(p_freq * p_y_max * math.pi)
-top_width = p_width_top
-# 開口部に横一列（または複数列）で配置
-start_x = top_center_x - top_width/2.0 + psize
-end_x = top_center_x + top_width/2.0 - psize
-
-# --- 修正: 斜め配置のためのY座標設定 ---
-# 左側(start_x)を高く、右側(end_x)を低くする
-y_left = p_y_max - psize * 2.0          # 左上の高さ
-y_right = y_left - top_width * 0.6      # 右下の高さ（0.6は傾きの強さ。適宜調整可）
-
-# 全幅（0除算防止のため小さな値を足しておく）
-total_w = end_x - start_x
-if total_w <= 0: total_w = 1.0
-
-curr_x = start_x
-while curr_x <= end_x:
-    # 現在のXが左端からどれくらいの割合(0.0 ~ 1.0)の位置にあるか計算
-    ratio = (curr_x - start_x) / total_w
-    
-    # 割合に応じたY座標を計算（線形補間）
-    curr_y = y_left * (1.0 - ratio) + y_right * ratio
-    
-    top_emitters_list.append([curr_x, curr_y]) 
-    curr_x += psize
-
-top_emitters_np = numpy.array(top_emitters_list, dtype=numpy.float32)
-N_top_emitters = len(top_emitters_list)
-
-# Taichiフィールドへ転送
-top_emitters_pos = ti.Vector.field(2, ti.f32, shape=(N_top_emitters))
-top_emitters_pos.from_numpy(top_emitters_np)
-top_inflow_vel = ti.Vector([-0.5, -1.0])
-
-array_type = numpy.array(array_type,dtype=numpy.int32)
-array_pos = numpy.array(array_pos,dtype=numpy.float32)
+array_type = np.array(array_type,dtype=np.int32)
+array_pos = np.array(array_pos,dtype=np.float32)
 N_particles = len(array_pos) # 粒子数
 
 
@@ -281,6 +191,8 @@ particles_pres = ti.field(ti.f32,shape=(N_particles)) # 圧力[Pa]
 particles_color = ti.field(ti.i32,shape=(N_particles)) # 描画する色
 
 particles_stagnant_time = ti.field(ti.f32,shape=(N_particles)) # 停滞時間
+particles_vorticity = ti.field(ti.f32,shape=(N_particles)) # 渦度
+particles_pseudo_z = ti.field(ti.f32,shape=(N_particles)) # 擬似深度（0.0～1.0）
 
 # バケットデータ
 Nx_buckets = int((domain[1]-domain[0]).x/re)+1
@@ -303,8 +215,8 @@ for ix,iy in ti.ndrange((-10,11),(-10,11)):
     if x_i**2+y_i**2 < (psize*10)**2:
         array_pos.append([x_i,y_i])
         array_vel.append([-0.5,-1.0])
-array_pos = numpy.array(array_pos,dtype=numpy.float32)
-array_vel = numpy.array(array_vel,dtype=numpy.float32)
+array_pos = np.array(array_pos,dtype=np.float32)
+array_vel = np.array(array_vel,dtype=np.float32)
 N_injectors = len(array_pos)
 injectors_pos = ti.Vector.field(2,ti.f32,shape=(N_injectors)) # 流入位置
 injectors_vel = ti.Vector.field(2,ti.f32,shape=(N_injectors)) # 流入速度
@@ -378,11 +290,10 @@ def initialize():
     for i in range(N_particles):
         particles_type[i] = particles_type_ini[i]
         particles_pos[i] = particles_pos_ini[i]
-        if particles_type[i] == type_fluid:
-            particles_vel[i] = initial_fluid_velocity
-        else:
-            particles_vel[i] = ti.Vector([0.0, 0.0])
+        particles_vel[i] = (0.0,0.0)
         particles_stagnant_time[i] = 0.0
+        particles_vorticity[i] = 0.0
+        particles_pseudo_z[i] = 0.0
 
     # 時間の変数の初期化
     step[None] = 0
@@ -505,51 +416,6 @@ def update():
                 particles_type[j_ghost] = type_fluid
                 particles_vel[j_ghost] = injectors_vel[i]
                 particles_pos[j_ghost] = pos_i
-
-    # --- 追加：上端からの自動流入処理 ---
-    for i in range(N_top_emitters):
-        # エミッター位置
-        pos_emit = top_emitters_pos[i]
-        
-        # エミッター位置に近接する粒子を探す（詰まっているか判定）
-        dist_sqr_min = re**2
-        bx0 = int((pos_emit - domain[0]).x / re)
-        by0 = int((pos_emit - domain[0]).y / re)
-        
-        # 近くに粒子があるかチェック
-        is_clogged = False
-        
-        for bx, by in ti.ndrange((bx0 - 1, bx0 + 2), (by0 - 1, by0 + 2)):
-            if bx < 0 or bx >= Nx_buckets or by < 0 or by >= Ny_buckets:
-                continue
-            for l in range(table_cnt[bx, by]):
-                j = table_data[bx, by, l]
-                pos_ij = particles_pos[j] - pos_emit
-                dist_sqr_ij = pos_ij.norm_sqr()
-                
-                # 半径 psize 以内に粒子があれば「詰まっている」とみなして生成しない
-                if dist_sqr_ij < psize**2:
-                    is_clogged = True
-                    # もしその詰まっている粒子が流体なら、流入速度で上書きして押し込む（オプション）
-                    if particles_type[j] == type_fluid:
-                         particles_vel[j] = top_inflow_vel
-        
-        # 詰まっていない場合のみ生成
-        if not is_clogged:
-            # 空きスロットを探す
-            j_ghost = -1
-            for j in range(N_particles):
-                if particles_type[j] == type_ghost:
-                    # 簡易的な確保（並列競合は稀なので許容）
-                    if ti.atomic_min(particles_type[j], type_fluid) == type_ghost:
-                        j_ghost = j
-                        break
-            
-            # 粒子生成
-            if j_ghost != -1:
-                particles_type[j_ghost] = type_fluid
-                particles_vel[j_ghost] = top_inflow_vel
-                particles_pos[j_ghost] = pos_emit
 
     # バケットの更新
     bucket_update()
@@ -711,15 +577,124 @@ def update():
     time[None] += dt[None]
 
 
+# 渦度計算カーネル
+@ti.kernel
+def compute_vorticity():
+    # バケットの更新
+    bucket_update()
+
+    for i in range(N_particles):
+        particles_vorticity[i] = 0.0
+        if particles_type[i] != type_fluid:
+            continue
+
+        # 近傍粒子探索ループ
+        bx0 = int((particles_pos[i]-domain[0]).x/re)
+        by0 = int((particles_pos[i]-domain[0]).y/re)
+        for bx,by in ti.ndrange((bx0-1,bx0+2),(by0-1,by0+2)):
+            if bx < 0 or bx >= Nx_buckets or by < 0 or by >= Ny_buckets:
+                continue
+            for l in range(table_cnt[bx,by]):
+                j = table_data[bx,by,l]
+                if j == i:
+                    continue
+                pos_ij = particles_pos[j]-particles_pos[i]
+                dist_ij = pos_ij.norm()
+
+                # 渦度の計算（SPH近似）
+                # ω = ∂v_y/∂x - ∂v_x/∂y
+                if dist_ij < re and dist_ij > 1e-6:
+                    vel_ij = particles_vel[j] - particles_vel[i]
+                    # 重み関数の勾配: ∇W = -pos_ij/dist * dW/dr
+                    dw_dr = -2.0*(1.0-dist_ij/re)/re
+                    grad_w_x = -pos_ij.x/dist_ij * dw_dr
+                    grad_w_y = -pos_ij.y/dist_ij * dw_dr
+                    # 渦度 = Σ (vel_ij.x * grad_w_y - vel_ij.y * grad_w_x)
+                    particles_vorticity[i] += vel_ij.x * grad_w_y - vel_ij.y * grad_w_x
+
+
+# 擬似深度計算カーネル
+@ti.kernel
+def compute_pseudo_depth():
+    # 最大値を計算
+    pres_max = 0.0
+    vel_max = 0.0
+    for i in range(N_particles):
+        if particles_type[i] == type_fluid:
+            ti.atomic_max(pres_max, particles_pres[i])
+            ti.atomic_max(vel_max, particles_vel[i].norm())
+
+    # 擬似深度を計算
+    for i in range(N_particles):
+        if particles_type[i] == type_fluid:
+            # 正規化された圧力と速度
+            p_norm = particles_pres[i] / (pres_max + 1e-6)
+            v_norm = particles_vel[i].norm() / (vel_max + 1e-6)
+            # ノイズ成分（位置ベースのランダム）
+            noise = ti.math.sin(particles_pos[i].x * 10.0) * ti.math.cos(particles_pos[i].y * 10.0) * 0.5 + 0.5
+            # 重み付き和
+            z = depth_pressure_weight * p_norm + depth_velocity_weight * v_norm + depth_noise_weight * noise
+            particles_pseudo_z[i] = ti.math.clamp(z, 0.0, 1.0)
+        else:
+            particles_pseudo_z[i] = 0.5
+
+
 # 色計算カーネル
 @ti.kernel
 def update_colors():
     for i in range(N_particles):
         if particles_type[i] == type_fluid:
-            a = ti.math.clamp(particles_vel[i].norm(),0.0,1.0)
-            r = a
-            b = 1.0-a
+            # 渦度ベースの色計算
+            vort_abs = ti.abs(particles_vorticity[i])
+            vort_normalized = ti.math.clamp(vort_abs * vorticity_scale, 0.0, 1.0)
+
+            # 色変数を初期化
+            r = 0.0
             g = 0.0
+            b = 0.0
+
+            # 渦度による色マッピング（青→緑→黄→赤）
+            if vort_normalized < 0.33:
+                # 青から緑へ（層流）
+                t = vort_normalized / 0.33
+                r = 0.0
+                g = t
+                b = 1.0 - t * 0.5
+            elif vort_normalized < 0.66:
+                # 緑から黄色へ（遷移）
+                t = (vort_normalized - 0.33) / 0.33
+                r = t
+                g = 1.0
+                b = 0.5 - t * 0.5
+            else:
+                # 黄色から赤へ（乱流）
+                t = (vort_normalized - 0.66) / 0.34
+                r = 1.0
+                g = 1.0 - t
+                b = 0.0
+
+            # 擬似深度によるフォグ効果
+            z = particles_pseudo_z[i]
+            fog_factor = ti.math.exp(-z * fog_distance)
+            fog_color_r = 0.3
+            fog_color_g = 0.4
+            fog_color_b = 0.6
+
+            # フォグを適用
+            r = r * fog_factor + fog_color_r * (1.0 - fog_factor)
+            g = g * fog_factor + fog_color_g * (1.0 - fog_factor)
+            b = b * fog_factor + fog_color_b * (1.0 - fog_factor)
+
+            # 深度による明度調整
+            brightness = 0.5 + 0.5 * (1.0 - z)
+            r *= brightness
+            g *= brightness
+            b *= brightness
+
+            # 最終的な色
+            r = ti.math.clamp(r, 0.0, 1.0)
+            g = ti.math.clamp(g, 0.0, 1.0)
+            b = ti.math.clamp(b, 0.0, 1.0)
             particles_color[i] = 0x010000*ti.i32(r*255)+0x000100*ti.i32(g*255)+0x000001*ti.i32(b*255)
         elif particles_type[i] == type_wall:
             particles_color[i] = 0x808080
@@ -735,7 +710,7 @@ print('lambda0 =',lambda0[None])
 window_size = (640,640)
 scale_to_pixel = window_size[0]/(domain[1]-domain[0]).x
 gui = ti.GUI(os.path.basename(__file__),window_size)
-video_manager = ti.tools.VideoManager(output_dir="./results", framerate=30, automatic_build=False)
+
 
 # ウィジェット
 slider_forwards = gui.slider('fast-forward',1,20)
@@ -764,6 +739,8 @@ while gui.running:
             initialize()
 
     # 現在の状態を描画する
+    compute_vorticity()
+    compute_pseudo_depth()
     update_colors()
     if mouse_state[None] == 1:
         J = injectors_pos.to_numpy()
@@ -776,16 +753,16 @@ while gui.running:
 
     T = particles_type.to_numpy()
     C = particles_color.to_numpy()
-    gui.circles(X[(T!=type_ghost),:],radius=psize*0.5*scale_to_pixel,color=C[(T!=type_ghost)])
+    Z = particles_pseudo_z.to_numpy()
+
+    # 擬似深度によるスケーリング効果
+    # 奥の粒子（z が大きい）を小さく表示
+    non_ghost_mask = (T != type_ghost)
+    scale_depth = 1.0 / (1.0 + depth_scale_factor * Z[non_ghost_mask])
+    radius_array = psize * 0.5 * scale_to_pixel * scale_depth
+
+    gui.circles(X[non_ghost_mask,:], radius=radius_array, color=C[non_ghost_mask])
     
     gui.text(f'Step: {step[None]}, Time: {time[None]:.6f}, substeps = {substeps[None]}',(0.0,1.0),font_size=20,color=0xFFFFFF)
-    gui.text(f'Particles: {numpy.count_nonzero(T==type_fluid)} / {numpy.count_nonzero(T==type_wall)} / {numpy.count_nonzero(T==type_ghost)}',(0.0,0.975),font_size=20,color=0xFFFFFF)
-    
-    img = gui.get_image()
-    video_manager.write_frame(img)
+    gui.text(f'Particles: {np.count_nonzero(T==type_fluid)} / {np.count_nonzero(T==type_wall)} / {np.count_nonzero(T==type_ghost)}',(0.0,0.975),font_size=20,color=0xFFFFFF)
     gui.show()
-
-print("Generating video...")
-video_manager.make_video(gif=False, mp4=True)
-shutil.rmtree('results/frames')
-print("Video saved to ./results folder (Frames deleted)")
