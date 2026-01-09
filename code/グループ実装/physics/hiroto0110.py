@@ -1,3 +1,4 @@
+#渦追加、堆積・空間成長モデル追加、くねった管壁作成関数修正
 import taichi as ti
 import numpy as np
 import math
