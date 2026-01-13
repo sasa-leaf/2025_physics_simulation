@@ -35,7 +35,7 @@ collision_dist = psize*0.9 # 衝突判定距離
 collision_coef = 0.5 # 反発係数
 
 # 侵食モデル
-erosion_prob = 0.2
+erosion_prob = 0.04
 erosion_dist = psize * 1.1
 
 # 堆積モデル
@@ -796,5 +796,5 @@ while gui.running:
 if SAVE_VIDEO:
     print("Generating video...")
     video_manager.make_video(gif=False, mp4=True)
-    # shutil.rmtree('results/frames')
+    shutil.rmtree('results/frames')
     print("Video saved to ./results folder (Frames deleted)")
